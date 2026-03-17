@@ -1,0 +1,62 @@
+# ============================================================
+# Face Recognition Attendance System - Configuration
+# Powered by InspireFace SDK
+# ============================================================
+
+# --- InspireFace Backend ---
+# Replaces: BlazeFace detector, SORT tracker, face aligner,
+#           MiniFASNetV2 anti-spoof, MobileFaceNet recognizer
+inspireface:
+  model_pack: "Pikachu"        # "Pikachu" (lightweight) or "Megatron" (high accuracy)
+  detect_mode: "light_track"   # "light_track" (with tracking) or "always_detect"
+  detect_pixel_level: 320      # Detection input resolution
+  max_detect_num: 20           # Maximum faces to detect per frame
+  confidence_threshold: 0.5    # Detection confidence threshold
+  liveness_threshold: 0.5      # RGB liveness threshold (anti-spoof)
+  quality_threshold: 0.3       # Face quality threshold
+  features:
+    recognition: true
+    liveness: true
+    quality: true
+    mask_detect: false
+    interaction: false
+
+# --- Face Quality Filter ---
+quality:
+  enabled: true
+  min_face_size: 80            # Minimum face size in pixels
+  max_yaw: 45.0                # Maximum face yaw angle (degrees)
+  max_pitch: 35.0              # Maximum face pitch angle (degrees)
+
+# --- Anti-Spoofing ---
+anti_spoof:
+  enabled: true
+
+# --- Face Recognition ---
+recognition:
+  embedding_dim: 512
+  similarity_threshold: 0.4    # Cosine similarity threshold for match
+  max_top_k: 1
+
+# --- Face Database ---
+database:
+  path: "data/database/face_db.npz"
+  max_embeddings_per_person: 5
+  hnsw_ef_construction: 200    # HNSW index build quality
+  hnsw_M: 16                   # HNSW connections per node
+
+# --- Video Processing ---
+video:
+  frame_skip: 3                # Process every Nth frame
+  max_frame_width: 640         # Resize frame to this max width
+  batch_size: 1
+  use_threading: true          # Enable threaded video decoding
+  queue_size: 10               # Frame queue size for threading
+
+# --- Attendance ---
+attendance:
+  cooldown_seconds: 30         # Min seconds between same person's records
+  output_dir: "output"
+  export_formats:
+    - "csv"
+    - "json"

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.onnx
+models/
+data/
+output/
+*.npz
+.env
+venv/
+.venv/
