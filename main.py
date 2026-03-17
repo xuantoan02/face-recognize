@@ -119,6 +119,10 @@ def cmd_process(args, config: dict):
     # Process video
     stats = processor.process_video(args.video)
 
+    # Print output video path
+    if "output_video" in stats:
+        print(f"\n🎬 Output video saved: {stats['output_video']}")
+
     # Export results
     export_formats = attendance_config.get("export_formats", ["csv", "json"])
 

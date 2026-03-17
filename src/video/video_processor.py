@@ -5,6 +5,7 @@ Reads video files, samples frames, runs the recognition pipeline,
 deduplicates attendance records, and exports results.
 
 Optimized with threaded video decoding for improved FPS.
+Saves annotated output video with face recognition results.
 """
 
 import csv
@@ -32,6 +33,10 @@ class VideoDecodeThread(threading.Thread):
     Decodes frames ahead of the processing pipeline to maximize
     CPU utilization — the decode thread runs while the main thread
     processes the previous frame.
+
+    Sends ALL frames to the queue for smooth output video.
+    Frames that should be processed by the pipeline are marked with
+    should_process=True.
     """
 
     def __init__(
@@ -49,6 +54,8 @@ class VideoDecodeThread(threading.Thread):
         self.stopped = False
         self.total_frames = 0
         self.fps = 0.0
+        self.frame_width = 0
+        self.frame_height = 0
 
     def run(self):
         cap = cv2.VideoCapture(self.video_path)
@@ -65,10 +72,6 @@ class VideoDecodeThread(threading.Thread):
             if not ret:
                 break
 
-            if frame_idx % self.frame_skip != 0:
-                frame_idx += 1
-                continue
-
             # Resize if needed
             h, w = frame.shape[:2]
             if w > self.max_frame_width:
@@ -77,8 +80,18 @@ class VideoDecodeThread(threading.Thread):
                 new_h = int(h * scale)
                 frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
+            # Store frame dimensions (after resize) for video writer
+            if frame_idx == 0:
+                fh, fw = frame.shape[:2]
+                self.frame_width = fw
+                self.frame_height = fh
+
+            should_process = (frame_idx % self.frame_skip == 0)
+
             try:
-                self.frame_queue.put((frame_idx, frame), timeout=5.0)
+                self.frame_queue.put(
+                    (frame_idx, frame, should_process), timeout=5.0
+                )
             except queue.Full:
                 if self.stopped:
                     break
@@ -101,6 +114,7 @@ class VideoProcessor:
     - Configurable frame skipping for performance
     - Frame resizing for weak CPUs
     - Attendance tracking with debounce (via AttendanceTracker)
+    - Saves annotated output video with recognition results
     - CSV and JSON export
     """
 
@@ -126,6 +140,9 @@ class VideoProcessor:
             cooldown_seconds=cooldown_seconds,
         )
 
+        # Last frame result for drawing on skipped frames
+        self._last_result: FrameResult | None = None
+
     def _update_attendance(self, records: list[AttendanceRecord]):
         """Update attendance using the debounce tracker."""
         for record in records:
@@ -144,17 +161,110 @@ class VideoProcessor:
                 frame_idx=record.frame_idx,
             )
 
+    @staticmethod
+    def draw_results_on_frame(
+        frame: np.ndarray,
+        result: FrameResult,
+    ) -> np.ndarray:
+        """
+        Draw face recognition results on a frame.
+
+        Draws bounding boxes, names, similarity scores, spoof labels,
+        and face landmarks.
+
+        Args:
+            frame: BGR image (will be copied)
+            result: FrameResult from pipeline
+
+        Returns:
+            Annotated copy of the frame
+        """
+        draw = frame.copy()
+        h, w = draw.shape[:2]
+        scale = max(w, h) / 1000.0
+        line_thickness = max(1, int(2 * scale))
+        font_scale = max(0.4, 0.5 * scale)
+
+        # Build a lookup from track_id → record for quick matching
+        record_by_track: dict[int, AttendanceRecord] = {}
+        for rec in result.records:
+            if rec.track_id >= 0:
+                record_by_track[rec.track_id] = rec
+
+        for i, det in enumerate(result.detections):
+            x1, y1, x2, y2 = det.bbox.astype(int)
+            track_id = det.track_id
+
+            # Find the matching record
+            record = record_by_track.get(track_id)
+
+            if record is None:
+                # Detection without a record (filtered by quality, etc.)
+                color = (128, 128, 128)  # Gray
+                cv2.rectangle(draw, (x1, y1), (x2, y2), color, 1)
+                continue
+
+            if not record.is_real:
+                # Spoofed face — red
+                color = (0, 0, 255)
+                label = f"SPOOF ({record.spoof_confidence:.2f})"
+            elif record.person_id == "unknown":
+                # Unknown face — orange
+                color = (0, 165, 255)
+                label = f"Unknown ({record.similarity:.2f})"
+            else:
+                # Recognized face — green
+                color = (0, 255, 0)
+                label = f"{record.name} ({record.similarity:.2f})"
+
+            # Draw bounding box
+            cv2.rectangle(draw, (x1, y1), (x2, y2), color, line_thickness)
+
+            # Draw label background + text
+            label_with_id = f"[{track_id}] {label}" if track_id >= 0 else label
+            (tw, th), _ = cv2.getTextSize(
+                label_with_id, cv2.FONT_HERSHEY_SIMPLEX, font_scale, line_thickness
+            )
+            label_y = max(y1 - 10, th + 5)
+            # Background rectangle for readability
+            cv2.rectangle(
+                draw,
+                (x1, label_y - th - 4),
+                (x1 + tw + 4, label_y + 4),
+                color, -1,
+            )
+            cv2.putText(
+                draw, label_with_id, (x1 + 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                (255, 255, 255), line_thickness,
+            )
+
+            # Draw landmarks
+            if det.landmarks is not None and len(det.landmarks) > 0:
+                lm_color = (255, 200, 0) if record.is_real else (128, 128, 128)
+                for lx, ly in det.landmarks.astype(int):
+                    cv2.circle(draw, (lx, ly), max(2, int(2 * scale)), lm_color, -1)
+
+        return draw
+
+    def _get_output_video_path(self, video_path: str) -> str:
+        """Get the output video path based on input video name."""
+        os.makedirs(self.output_dir, exist_ok=True)
+        basename = os.path.splitext(os.path.basename(video_path))[0]
+        return os.path.join(self.output_dir, f"{basename}_annotated.mp4")
+
     def process_video(self, video_path: str) -> dict:
         """
         Process a video file and generate attendance report.
 
         Uses threaded decoding when enabled for better performance.
+        Saves annotated output video.
 
         Args:
             video_path: path to video file
 
         Returns:
-            dict with processing stats
+            dict with processing stats (includes 'output_video' path)
         """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
@@ -162,6 +272,7 @@ class VideoProcessor:
         # Reset state
         self.attendance_tracker.reset()
         self.pipeline.reset()
+        self._last_result = None
 
         if self.use_threading:
             return self._process_threaded(video_path)
@@ -184,6 +295,10 @@ class VideoProcessor:
         # Wait briefly for metadata
         time.sleep(0.1)
 
+        # Setup video writer
+        output_path = self._get_output_video_path(video_path)
+        writer = None
+
         logger.info(
             f"Processing video (threaded): {video_path}\n"
             f"  Frame skip: {self.frame_skip}, "
@@ -201,35 +316,62 @@ class VideoProcessor:
             if item is None:
                 break
 
-            frame_idx, frame = item
+            frame_idx, frame, should_process = item
 
-            # Run pipeline
-            result = self.pipeline.process_frame(frame, frame_idx)
-
-            # Update attendance
-            self._update_attendance(result.records)
-
-            total_faces += len(result.detections)
-            total_time_ms += result.processing_time_ms
-            processed_count += 1
-
-            # Progress logging
-            if processed_count % 50 == 0:
-                avg_ms = total_time_ms / processed_count
+            # Init video writer on first frame
+            if writer is None:
+                fh, fw = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                fps = decoder.fps if decoder.fps > 0 else 25.0
+                writer = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
                 logger.info(
-                    f"Progress: frame {frame_idx}/{decoder.total_frames} "
-                    f"({100 * frame_idx / max(decoder.total_frames, 1):.1f}%), "
-                    f"avg {avg_ms:.1f}ms/frame, "
-                    f"faces: {total_faces}"
+                    f"  Output video: {output_path} ({fw}x{fh} @ {fps:.1f}fps)"
                 )
+
+            if should_process:
+                # Run pipeline
+                result = self.pipeline.process_frame(frame, frame_idx)
+                self._last_result = result
+
+                # Update attendance
+                self._update_attendance(result.records)
+
+                total_faces += len(result.detections)
+                total_time_ms += result.processing_time_ms
+                processed_count += 1
+
+                # Draw results and write frame
+                annotated = self.draw_results_on_frame(frame, result)
+                writer.write(annotated)
+
+                # Progress logging
+                if processed_count % 50 == 0:
+                    avg_ms = total_time_ms / processed_count
+                    logger.info(
+                        f"Progress: frame {frame_idx}/{decoder.total_frames} "
+                        f"({100 * frame_idx / max(decoder.total_frames, 1):.1f}%), "
+                        f"avg {avg_ms:.1f}ms/frame, "
+                        f"faces: {total_faces}"
+                    )
+            else:
+                # Skipped frame — draw last known results for smooth video
+                if self._last_result is not None:
+                    annotated = self.draw_results_on_frame(frame, self._last_result)
+                    writer.write(annotated)
+                else:
+                    writer.write(frame)
 
         decoder.stop()
         decoder.join(timeout=2.0)
+
+        if writer is not None:
+            writer.release()
 
         total_elapsed = time.time() - start_time
 
         stats = {
             "video_path": video_path,
+            "output_video": output_path,
             "total_frames": decoder.total_frames,
             "processed_frames": processed_count,
             "frame_skip": self.frame_skip,
@@ -263,6 +405,10 @@ class VideoProcessor:
             f"Max width: {self.max_frame_width}"
         )
 
+        # Setup video writer
+        output_path = self._get_output_video_path(video_path)
+        writer = None
+
         frame_idx = 0
         processed_count = 0
         total_faces = 0
@@ -274,10 +420,6 @@ class VideoProcessor:
             if not ret:
                 break
 
-            if frame_idx % self.frame_skip != 0:
-                frame_idx += 1
-                continue
-
             # Resize for performance
             h, w = frame.shape[:2]
             if w > self.max_frame_width:
@@ -286,34 +428,60 @@ class VideoProcessor:
                 new_h = int(h * scale)
                 frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-            # Run pipeline
-            result = self.pipeline.process_frame(frame, frame_idx)
-
-            # Update attendance
-            self._update_attendance(result.records)
-
-            total_faces += len(result.detections)
-            total_time_ms += result.processing_time_ms
-            processed_count += 1
-
-            # Progress logging
-            if processed_count % 50 == 0:
-                avg_ms = total_time_ms / processed_count
+            # Init video writer on first frame
+            if writer is None:
+                fh, fw = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out_fps = fps if fps > 0 else 25.0
+                writer = cv2.VideoWriter(output_path, fourcc, out_fps, (fw, fh))
                 logger.info(
-                    f"Progress: frame {frame_idx}/{total_frames} "
-                    f"({100 * frame_idx / max(total_frames, 1):.1f}%), "
-                    f"avg {avg_ms:.1f}ms/frame, "
-                    f"faces: {total_faces}"
+                    f"  Output video: {output_path} ({fw}x{fh} @ {out_fps:.1f}fps)"
                 )
+
+            if frame_idx % self.frame_skip == 0:
+                # Run pipeline
+                result = self.pipeline.process_frame(frame, frame_idx)
+                self._last_result = result
+
+                # Update attendance
+                self._update_attendance(result.records)
+
+                total_faces += len(result.detections)
+                total_time_ms += result.processing_time_ms
+                processed_count += 1
+
+                # Draw results and write frame
+                annotated = self.draw_results_on_frame(frame, result)
+                writer.write(annotated)
+
+                # Progress logging
+                if processed_count % 50 == 0:
+                    avg_ms = total_time_ms / processed_count
+                    logger.info(
+                        f"Progress: frame {frame_idx}/{total_frames} "
+                        f"({100 * frame_idx / max(total_frames, 1):.1f}%), "
+                        f"avg {avg_ms:.1f}ms/frame, "
+                        f"faces: {total_faces}"
+                    )
+            else:
+                # Skipped frame — draw last known results for smooth video
+                if self._last_result is not None:
+                    annotated = self.draw_results_on_frame(frame, self._last_result)
+                    writer.write(annotated)
+                else:
+                    writer.write(frame)
 
             frame_idx += 1
 
         cap.release()
+        if writer is not None:
+            writer.release()
 
         total_elapsed = time.time() - start_time
 
         stats = {
             "video_path": video_path,
+            "output_video": output_path,
             "total_frames": total_frames,
             "processed_frames": processed_count,
             "frame_skip": self.frame_skip,
@@ -343,7 +511,8 @@ class VideoProcessor:
             f"  Avg {stats['avg_frame_time_ms']:.1f}ms/frame "
             f"({stats['effective_fps']:.1f} FPS)\n"
             f"  Total faces detected: {total_faces}\n"
-            f"  Unique persons: {self.attendance_tracker.get_count()}"
+            f"  Unique persons: {self.attendance_tracker.get_count()}\n"
+            f"  Output video: {stats.get('output_video', 'N/A')}"
         )
 
     def get_attendance(self) -> list[dict]:
