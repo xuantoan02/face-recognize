@@ -7,6 +7,7 @@ using the Silent-Face-Anti-Spoofing approach with multi-scale analysis.
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -40,10 +41,14 @@ class AntiSpoof:
         threshold: float = 0.8,
         scales: list[float] | None = None,
         num_threads: int = 2,
+        providers: Optional[list[str]] = None,
     ):
         self.input_size = input_size
         self.threshold = threshold
         self.scales = scales or [2.7, 4.0]
+
+        if providers is None:
+            providers = ["CPUExecutionProvider"]
 
         # Load ONNX sessions
         sess_options = ort.SessionOptions()
@@ -56,7 +61,7 @@ class AntiSpoof:
             try:
                 session = ort.InferenceSession(
                     path, sess_options,
-                    providers=["CPUExecutionProvider"]
+                    providers=providers
                 )
                 self.sessions.append(session)
                 logger.info(f"AntiSpoof model loaded: {path}")

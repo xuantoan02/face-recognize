@@ -7,6 +7,7 @@ optimized for real-time performance on CPU.
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -84,10 +85,14 @@ class FaceDetector:
         confidence_threshold: float = 0.7,
         nms_iou_threshold: float = 0.3,
         num_threads: int = 2,
+        providers: Optional[list[str]] = None,
     ):
         self.input_size = input_size
         self.confidence_threshold = confidence_threshold
         self.nms_iou_threshold = nms_iou_threshold
+
+        if providers is None:
+            providers = ["CPUExecutionProvider"]
 
         # Load ONNX model
         sess_options = ort.SessionOptions()
@@ -97,7 +102,7 @@ class FaceDetector:
 
         self.session = ort.InferenceSession(
             model_path, sess_options,
-            providers=["CPUExecutionProvider"]
+            providers=providers
         )
 
         self.input_name = self.session.get_inputs()[0].name

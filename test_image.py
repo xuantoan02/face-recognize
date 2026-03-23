@@ -2,11 +2,18 @@
 Test the InspireFace pipeline with a single image.
 
 Usage:
+    # Default (InspireFace backend for recognition)
     python test_image.py <image_path>
-    python test_image.py <image_path> --save output.jpg
+
+    # Use FaceRecognizer (MobileFaceNet preprocessing)
+    python test_image.py <image_path> --recognizer face --rec-model models/recognition.onnx
+
+    # Use ONNXRecognizer (testmodel.py preprocessing)
+    python test_image.py <image_path> --recognizer onnx --rec-model models/recognition.onnx
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -16,6 +23,46 @@ import yaml
 
 from src.inspireface_backend.isf_session import InspireFaceBackend
 from src.database.vector_db import FaceDatabase
+from src.recognition import FaceRecognizer, ONNXRecognizer
+
+
+def _get_providers(device: str) -> list[str]:
+    if device == "gpu":
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
+def build_recognizer(recognizer_type, model_path, num_threads=2, providers=None):
+    """
+    Build a recognizer instance based on the chosen type.
+
+    Args:
+        recognizer_type: 'inspireface', 'face', or 'onnx'
+        model_path: Path to .onnx model file (required for 'face' / 'onnx')
+        num_threads: ONNX Runtime intra-op threads
+        providers: ONNX Runtime execution providers
+
+    Returns:
+        FaceRecognizer | ONNXRecognizer | None
+    """
+    if recognizer_type == "inspireface":
+        return None  # use backend.extract_feature()
+
+    if not model_path:
+        print("❌ --rec-model is required when --recognizer is 'face' or 'onnx'")
+        sys.exit(1)
+
+    if not os.path.isfile(model_path):
+        print(f"❌ Recognition model not found: {model_path}")
+        sys.exit(1)
+
+    if recognizer_type == "face":
+        return FaceRecognizer(model_path=model_path, num_threads=num_threads, providers=providers)
+    elif recognizer_type == "onnx":
+        return ONNXRecognizer(model_path=model_path, num_threads=num_threads, providers=providers)
+    else:
+        print(f"❌ Unknown recognizer type: {recognizer_type}")
+        sys.exit(1)
 
 
 def main():
@@ -23,6 +70,15 @@ def main():
     parser.add_argument("image", help="Path to input image")
     parser.add_argument("--save", "-s", default=None, help="Save annotated image to path")
     parser.add_argument("--config", "-c", default="config/default.yaml", help="Config file")
+    parser.add_argument(
+        "--recognizer", "-r",
+        choices=["inspireface", "face", "onnx"],
+        default="inspireface",
+        help="Recognizer to use: inspireface (default), face (FaceRecognizer), onnx (ONNXRecognizer)",
+    )
+    parser.add_argument("--rec-model", default=None, help="Path to .onnx recognition model (for face/onnx)")
+    parser.add_argument("--device", "-d", choices=["cpu", "gpu"], default="gpu",
+                        help="Thiết bị inference: cpu hoặc gpu (CUDA)")
     args = parser.parse_args()
 
     # Load config
@@ -46,6 +102,12 @@ def main():
         liveness_threshold=isf_config.get("liveness_threshold", 0.5),
         quality_threshold=isf_config.get("quality_threshold", 0.3),
     )
+
+    # Build recognizer
+    providers = _get_providers(args.device)
+    recognizer = build_recognizer(args.recognizer, args.rec_model, providers=providers)
+    rec_label = args.recognizer.upper()
+    print(f"🧠 Recognizer: {rec_label}" + (f" ({args.rec_model})" if args.rec_model else ""))
 
     # Load database (for recognition matching)
     db_config = config.get("database", {})
@@ -133,12 +195,23 @@ def main():
         else:
             # REAL — extract features + match DB
             t0 = time.time()
-            embedding = backend.extract_feature(image, det)
+
+            if recognizer is not None:
+                # Use FaceRecognizer or ONNXRecognizer
+                face_crop = image[y1:y2, x1:x2]
+                if face_crop.size == 0:
+                    print(f"   ⚠️  Empty face crop, skipping")
+                    continue
+                embedding = recognizer.get_embedding(face_crop)
+            else:
+                # Use InspireFace backend
+                embedding = backend.extract_feature(image, det)
+
             feat_ms = (time.time() - t0) * 1000
 
             match = database.search(embedding, threshold=recognition_threshold)
 
-            print(f"   🧬 Embedding: shape={embedding.shape}, extraction={feat_ms:.1f}ms")
+            print(f"   🧬 Embedding: shape={embedding.shape}, extraction={feat_ms:.1f}ms (via {rec_label})")
 
             if match.matched:
                 print(f"   ✅ Match: {match.name} (ID: {match.person_id}, sim={match.similarity:.3f})")
@@ -163,6 +236,7 @@ def main():
 
     print(f"\n{'=' * 60}")
     print(f"📊 Summary:")
+    print(f"   Recognizer:  {rec_label}")
     print(f"   Total faces: {len(detections)}")
     print(f"   ✅ Real:     {real_count}")
     print(f"   🚫 Spoofed:  {fake_count}")
@@ -173,7 +247,6 @@ def main():
 
     # Save annotated image
     save_path = args.save or "output/test_result.jpg"
-    import os
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     cv2.imwrite(save_path, draw)
     print(f"\n💾 Annotated image saved: {save_path}")

@@ -7,9 +7,9 @@ build/
 .eggs/
 *.onnx
 models/
-data/
 output/
 *.npz
 .env
 venv/
 .venv/
+venv-convert/
